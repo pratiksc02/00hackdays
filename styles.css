@@ -1,0 +1,38 @@
+/* Custom Scrollbars for the Application */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #020617;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1e293b;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #334155;
+}
+
+/* Custom Input Range Slider Styling */
+input[type=range]::-webkit-slider-thumb {
+  border: 2px solid #0f172a;
+  height: 18px;
+  width: 18px;
+  border-radius: 50%;
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.5);
+  cursor: pointer;
+}
+
+/* Pulse animation utility for telemetry badges */
+@keyframes pulseGlow {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.02); }
+}
+
+.status-alert {
+  animation: pulseGlow 1s infinite ease-in-out;
+}

@@ -591,3 +591,17 @@ window.exportSessionCSV = function() {
 
   addLog('Session posture report exported as CSV.', 'success');
 };
+window.addEventListener('DOMContentLoaded', () => {
+  const controlsPanel = document.querySelector('.controls-panel') || document.querySelector('#controls');
+  if (controlsPanel) {
+    const presetDiv = document.createElement('div');
+    presetDiv.style.margin = '10px 0';
+    presetDiv.innerHTML = `
+      <p style="font-size: 12px; font-weight: bold; margin-bottom: 5px;">Quick Presets:</p>
+      <button onclick="applyPreset('strict')" style="margin-right: 5px; padding: 4px 8px;">Strict</button>
+      <button onclick="applyPreset('normal')" style="margin-right: 5px; padding: 4px 8px;">Normal</button>
+      <button onclick="applyPreset('relaxed')" style="padding: 4px 8px;">Relaxed</button>
+    `;
+    controlsPanel.prepend(presetDiv);
+  }
+});

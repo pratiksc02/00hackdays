@@ -1,361 +1,593 @@
- let state = {
-  mode: 'hardware',         // 'hardware' or 'vision'
-  pitch: 5.0,               // Current pitch angle in degrees
-  baseline: 0.0,            // Calibrated zero baseline
-  threshold: 15.0,          // Slouch threshold sensitivity
-  isAudioEnabled: true,     // Web Audio haptic alert toggle
-  slouchSeconds: 0,         // Continuous slouch timer
-  score: 98,                // Ergonomic health score (0 - 100)
-  history: Array(20).fill(5), // 20-second historical pitch readings
-  isSimulating: false,      // Auto slouch simulation flag
-  simInterval: null,
-  timerInterval: null
+ /**
+ * PosturePulse Core Logic
+ * - Visual Human Spine Column Renderer
+ * - Real-time Slouch & Tilt Analytics
+ * - Web Audio & Haptic Feedback API
+ * - Native OS Desktop Notifications & Break Reminders
+ * - CSV Data Exporting
+ */
+
+// Application State
+const state = {
+  isRunning: false,
+  isDemoMode: false,
+  isMuted: false,
+  baseline: {
+    eyeShoulderDist: null,
+    shoulderAngle: 0,
+  },
+  thresholds: {
+    slouchSensPercent: 15,
+    tiltAngleDeg: 8,
+    alertDelaySec: 2.0,
+  },
+  metrics: {
+    slouchCount: 0,
+    goodTicks: 0,
+    totalTicks: 0,
+    sessionStartTime: null,
+  },
+  slouchStartTime: null,
+  isAlertActive: false,
+  continuousSittingTime: 0, // In seconds for stretch reminders
 };
 
-// CANVAS & AUDIO CONTEXT REFERENCE
-let canvas, ctx;
+// Sensitivity Preset Configurations
+const PRESETS = {
+  strict: { slouchPercent: 8, tiltAngle: 5, delaySec: 1.0 },
+  normal: { slouchPercent: 15, tiltAngle: 8, delaySec: 2.0 },
+  relaxed: { slouchPercent: 25, tiltAngle: 12, delaySec: 3.5 },
+};
+
+// DOM Reference Selectors
+const elements = {
+  webcam: document.getElementById('webcam'),
+  canvas: document.getElementById('outputCanvas'),
+  ctx: document.getElementById('outputCanvas').getContext('2d'),
+  startCamBtn: document.getElementById('startCamBtn'),
+  calibrateBtn: document.getElementById('calibrateBtn'),
+  toggleAudioBtn: document.getElementById('toggleAudioBtn'),
+  audioIcon: document.getElementById('audioIcon'),
+  demoModeToggle: document.getElementById('demoModeToggle'),
+  themeToggleBtn: document.getElementById('themeToggleBtn'),
+  statusBadge: document.getElementById('statusBadge'),
+  statusText: document.getElementById('statusText'),
+  hudSlouchVal: document.getElementById('hudSlouchVal'),
+  hudTiltVal: document.getElementById('hudTiltVal'),
+  alertBanner: document.getElementById('alertBanner'),
+  alertMessage: document.getElementById('alertMessage'),
+  scoreText: document.getElementById('scoreText'),
+  slouchCountText: document.getElementById('slouchCountText'),
+  durationText: document.getElementById('durationText'),
+  eventLog: document.getElementById('eventLog'),
+  // Controls
+  slouchSensInput: document.getElementById('slouchSens'),
+  slouchSensVal: document.getElementById('slouchSensVal'),
+  tiltSensInput: document.getElementById('tiltSens'),
+  tiltSensVal: document.getElementById('tiltSensVal'),
+  alertDelayInput: document.getElementById('alertDelay'),
+  alertDelayVal: document.getElementById('alertDelayVal'),
+};
+
 let audioCtx = null;
+let poseDetector = null;
+let cameraInstance = null;
+let timerInterval = null;
+let stretchInterval = null;
+let demoAnimationFrame = null;
 
-// INITIALIZE APPLICATION
+// Initialization
 window.addEventListener('DOMContentLoaded', () => {
-  // Initialize Lucide Icons
-  if (window.lucide) {
-    lucide.createIcons();
-  }
-
-  // Setup HTML5 Canvas
-  canvas = document.getElementById('spineCanvas');
-  if (canvas) {
-    ctx = canvas.getContext('2d');
-    resizeCanvas();
-  }
-  
-  window.addEventListener('resize', resizeCanvas);
-
-  // Start Session Timers & Loops
-  startTelemetryTimer();
-  requestAnimationFrame(renderLoop);
-});
-
-// Extra resize trigger on page load to prevent blank 0x0 canvas
-window.addEventListener('load', () => {
+  setupEventListeners();
+  initMediaPipe();
   resizeCanvas();
-  renderChart();
+  requestNotificationPermission();
+
+  if (elements.demoModeToggle && elements.demoModeToggle.checked) {
+    toggleDemoMode();
+  }
 });
+
+function setupEventListeners() {
+  if (elements.startCamBtn) elements.startCamBtn.addEventListener('click', toggleCamera);
+  if (elements.calibrateBtn) elements.calibrateBtn.addEventListener('click', handleCalibration);
+  if (elements.toggleAudioBtn) elements.toggleAudioBtn.addEventListener('click', toggleAudio);
+  if (elements.demoModeToggle) elements.demoModeToggle.addEventListener('change', toggleDemoMode);
+  if (elements.themeToggleBtn) elements.themeToggleBtn.addEventListener('click', toggleTheme);
+
+  if (elements.slouchSensInput) {
+    elements.slouchSensInput.addEventListener('input', (e) => {
+      state.thresholds.slouchSensPercent = parseFloat(e.target.value);
+      if (elements.slouchSensVal) elements.slouchSensVal.textContent = `${state.thresholds.slouchSensPercent}%`;
+    });
+  }
+
+  if (elements.tiltSensInput) {
+    elements.tiltSensInput.addEventListener('input', (e) => {
+      state.thresholds.tiltAngleDeg = parseFloat(e.target.value);
+      if (elements.tiltSensVal) elements.tiltSensVal.textContent = `${state.thresholds.tiltAngleDeg}°`;
+    });
+  }
+
+  if (elements.alertDelayInput) {
+    elements.alertDelayInput.addEventListener('input', (e) => {
+      state.thresholds.alertDelaySec = parseFloat(e.target.value);
+      if (elements.alertDelayVal) elements.alertDelayVal.textContent = `${state.thresholds.alertDelaySec.toFixed(1)}s`;
+    });
+  }
+
+  window.addEventListener('resize', resizeCanvas);
+}
+
+// Feature: Request Native OS Notification Permissions
+function requestNotificationPermission() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+}
 
 function resizeCanvas() {
-  if (!canvas) return;
-  const rect = canvas.parentElement.getBoundingClientRect();
-  canvas.width = rect.width * (window.devicePixelRatio || 1);
-  canvas.height = rect.height * (window.devicePixelRatio || 1);
+  const container = elements.canvas ? elements.canvas.parentElement : null;
+  if (container) {
+    elements.canvas.width = container.clientWidth;
+    elements.canvas.height = container.clientHeight;
+  }
 }
 
-// UPDATE FUNCTIONS
-function updatePitch(val) {
-  state.pitch = parseFloat(val);
-  const pitchDisplay = document.getElementById('pitch-display');
-  const sliderPitchVal = document.getElementById('slider-pitch-val');
-  
-  if (pitchDisplay) pitchDisplay.innerText = `${state.pitch.toFixed(1)}°`;
-  if (sliderPitchVal) sliderPitchVal.innerText = `${state.pitch.toFixed(1)}°`;
+function initMediaPipe() {
+  if (typeof Pose === 'undefined') return;
+
+  poseDetector = new Pose({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`,
+  });
+
+  poseDetector.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+
+  poseDetector.onResults(onPoseResults);
 }
 
-function updateThreshold(val) {
-  state.threshold = parseFloat(val);
-  const cardVal = document.getElementById('threshold-display-card');
-  const sliderVal = document.getElementById('slider-threshold-val');
-  
-  if (cardVal) cardVal.innerText = `${state.threshold.toFixed(1)}°`;
-  if (sliderVal) sliderVal.innerText = `${state.threshold.toFixed(1)}°`;
+async function toggleCamera() {
+  if (state.isRunning && !state.isDemoMode) {
+    stopCamera();
+    return;
+  }
+
+  if (state.isDemoMode) {
+    if (elements.demoModeToggle) elements.demoModeToggle.checked = false;
+    toggleDemoMode();
+  }
+
+  try {
+    elements.startCamBtn.disabled = true;
+    elements.startCamBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Initializing...`;
+
+    cameraInstance = new Camera(elements.webcam, {
+      onFrame: async () => {
+        if (state.isRunning && poseDetector) {
+          await poseDetector.send({ image: elements.webcam });
+        }
+      },
+      width: 640,
+      height: 480,
+    });
+
+    await cameraInstance.start();
+    state.isRunning = true;
+    startSessionTimer();
+
+    elements.startCamBtn.disabled = false;
+    elements.startCamBtn.innerHTML = `<i class="fa-solid fa-stop"></i> Stop Camera`;
+    if (elements.calibrateBtn) elements.calibrateBtn.disabled = false;
+    updateStatus('good', 'Tracking Active');
+    addLog('Camera feed started successfully.', 'success');
+
+  } catch (err) {
+    console.error('Camera Error:', err);
+    addLog('Camera access denied or unreadable. Switching to Demo Mode.', 'danger');
+    elements.startCamBtn.disabled = false;
+    elements.startCamBtn.innerHTML = `<i class="fa-solid fa-play"></i> Start Camera`;
+    if (elements.demoModeToggle) elements.demoModeToggle.checked = true;
+    toggleDemoMode();
+  }
 }
 
-function recalibrate() {
-  state.baseline = state.pitch;
-  triggerHapticPulse(800, 100);
-  alert(`Calibrated Baseline set to ${state.baseline.toFixed(1)}°. Subtracted from pitch readings.`);
+function stopCamera() {
+  state.isRunning = false;
+  if (cameraInstance) {
+    cameraInstance.stop();
+  }
+  stopSessionTimer();
+  if (elements.startCamBtn) elements.startCamBtn.innerHTML = `<i class="fa-solid fa-play"></i> Start Camera`;
+  if (elements.calibrateBtn) elements.calibrateBtn.disabled = true;
+  updateStatus('neutral', 'System Ready');
+  addLog('Camera feed stopped.', 'info');
 }
 
-// AUDIO HAPTIC FEEDBACK (WEB AUDIO API)
-function initAudio() {
-  if (!audioCtx) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function onPoseResults(results) {
+  if (!state.isRunning) return;
+
+  const ctx = elements.ctx;
+  ctx.save();
+  ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
+  ctx.drawImage(results.image, 0, 0, elements.canvas.width, elements.canvas.height);
+
+  if (results.poseLandmarks) {
+    processLandmarks(results.poseLandmarks);
+  } else {
+    updateStatus('warn', 'Searching for Body...');
+  }
+
+  ctx.restore();
+}
+
+function processLandmarks(landmarks) {
+  const leftEye = landmarks[2];
+  const rightEye = landmarks[5];
+  const leftShoulder = landmarks[11];
+  const rightShoulder = landmarks[12];
+
+  if (!leftEye || !rightEye || !leftShoulder || !rightShoulder) return;
+
+  const eyeMidY = (leftEye.y + rightEye.y) / 2;
+  const shoulderMidY = (leftShoulder.y + rightShoulder.y) / 2;
+  const currentEyeShoulderDist = Math.abs(shoulderMidY - eyeMidY);
+
+  const dX = (rightShoulder.x - leftShoulder.x) * elements.canvas.width;
+  const dY = (rightShoulder.y - leftShoulder.y) * elements.canvas.height;
+  const currentTiltAngle = Math.abs(Math.atan2(dY, dX) * (180 / Math.PI));
+
+  if (!state.baseline.eyeShoulderDist) {
+    state.baseline.eyeShoulderDist = currentEyeShoulderDist;
+    state.baseline.shoulderAngle = currentTiltAngle;
+    addLog('Auto-calibrated upright posture baseline.', 'info');
+  }
+
+  const slouchRatio = ((state.baseline.eyeShoulderDist - currentEyeShoulderDist) / state.baseline.eyeShoulderDist) * 100;
+  const tiltDeviation = Math.abs(currentTiltAngle - state.baseline.shoulderAngle);
+
+  if (elements.hudSlouchVal) elements.hudSlouchVal.textContent = `${Math.max(0, slouchRatio.toFixed(0))}%`;
+  if (elements.hudTiltVal) elements.hudTiltVal.textContent = `${tiltDeviation.toFixed(1)}°`;
+
+  const isSlouching = slouchRatio > state.thresholds.slouchSensPercent;
+  const isTilting = tiltDeviation > state.thresholds.tiltAngleDeg;
+  const isBad = isSlouching || isTilting;
+
+  handlePostureStatus(isBad, isSlouching ? 'Forward Slouch' : 'Shoulder Tilt');
+
+  drawSpineOverlay(landmarks, isBad, slouchRatio);
+}
+
+function handlePostureStatus(hasBadPosture, reason) {
+  state.metrics.totalTicks++;
+
+  if (hasBadPosture) {
+    if (!state.slouchStartTime) {
+      state.slouchStartTime = Date.now();
+    }
+
+    const duration = (Date.now() - state.slouchStartTime) / 1000;
+
+    if (duration >= state.thresholds.alertDelaySec) {
+      if (!state.isAlertActive) {
+        state.isAlertActive = true;
+        state.metrics.slouchCount++;
+        if (elements.slouchCountText) elements.slouchCountText.textContent = state.metrics.slouchCount;
+        
+        // Trigger Multi-Channel Alerts
+        triggerAudioAlert();
+        triggerVibrationAlert();
+        triggerDesktopNotification(reason);
+
+        addLog(`Posture Alert: Bad posture detected (${reason}).`, 'danger');
+      }
+      if (elements.alertBanner) elements.alertBanner.classList.remove('hidden');
+      if (elements.alertMessage) elements.alertMessage.textContent = `Posture Alert! Fix ${reason}`;
+      updateStatus('bad', 'Bad Posture Detected');
+    } else {
+      updateStatus('warn', 'Checking Posture...');
+    }
+  } else {
+    state.slouchStartTime = null;
+    state.isAlertActive = false;
+    state.metrics.goodTicks++;
+    if (elements.alertBanner) elements.alertBanner.classList.add('hidden');
+    updateStatus('good', 'Posture Upright');
+  }
+
+  const score = Math.round((state.metrics.goodTicks / state.metrics.totalTicks) * 100) || 100;
+  if (elements.scoreText) elements.scoreText.textContent = `${score}%`;
+}
+
+// Feature: Desktop OS Notification Trigger
+function triggerDesktopNotification(reason) {
+  if ('Notification' in window && Notification.permission === 'granted') {
+    new Notification('Posture Warning! ⚠️️', {
+      body: `You are currently slouching (${reason}). Sit up straight!`,
+      icon: 'https://cdn-icons-png.flaticon.com/512/2823/2823860.png',
+    });
+  }
+}
+
+// Feature: Mobile Device Vibration Trigger
+function triggerVibrationAlert() {
+  if ('vibrate' in navigator) {
+    navigator.vibrate([200, 100, 200]);
+  }
+}
+
+/**
+ * Custom Spine & Vertebrae Renderer
+ */
+function drawSpineOverlay(landmarks, isBad, slouchRatio) {
+  const ctx = elements.ctx;
+  const width = elements.canvas.width;
+  const height = elements.canvas.height;
+
+  const color = isBad ? '#ef4444' : '#10b981';
+  const glowColor = isBad ? 'rgba(239, 68, 68, 0.4)' : 'rgba(16, 185, 129, 0.4)';
+
+  const nose = landmarks[0] || { x: 0.5, y: 0.25 };
+  const leftShoulder = landmarks[11] || { x: 0.38, y: 0.45 };
+  const rightShoulder = landmarks[12] || { x: 0.62, y: 0.45 };
+
+  const cervicalTop = { x: nose.x * width, y: (nose.y + 0.05) * height };
+  const thoracicMid = { 
+    x: ((leftShoulder.x + rightShoulder.x) / 2) * width, 
+    y: ((leftShoulder.y + rightShoulder.y) / 2) * height 
+  };
+
+  const curvatureOffset = Math.max(0, slouchRatio) * 1.5;
+  const lumbarMid = {
+    x: thoracicMid.x + (curvatureOffset > 0 ? curvatureOffset : 0),
+    y: thoracicMid.y + height * 0.2
+  };
+  const sacrumBase = {
+    x: thoracicMid.x,
+    y: lumbarMid.y + height * 0.15
+  };
+
+  ctx.beginPath();
+  ctx.moveTo(leftShoulder.x * width, leftShoulder.y * height);
+  ctx.lineTo(rightShoulder.x * width, rightShoulder.y * height);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(cervicalTop.x, cervicalTop.y);
+  ctx.quadraticCurveTo(thoracicMid.x + curvatureOffset, thoracicMid.y, lumbarMid.x, lumbarMid.y);
+  ctx.quadraticCurveTo(lumbarMid.x - (curvatureOffset * 0.5), sacrumBase.y, sacrumBase.x, sacrumBase.y);
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 6;
+  ctx.shadowColor = glowColor;
+  ctx.shadowBlur = 12;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  const totalVertebrae = 8;
+  for (let i = 0; i <= totalVertebrae; i++) {
+    const t = i / totalVertebrae;
+    const vx = Math.pow(1 - t, 2) * cervicalTop.x + 2 * (1 - t) * t * (thoracicMid.x + curvatureOffset) + Math.pow(t, 2) * lumbarMid.x;
+    const vy = Math.pow(1 - t, 2) * cervicalTop.y + 2 * (1 - t) * t * thoracicMid.y + Math.pow(t, 2) * lumbarMid.y;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(vx, vy, 7, 0, 2 * Math.PI);
+    ctx.fill();
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = color;
+  ctx.font = '10px sans-serif';
+  ctx.fillText('C1 Cervical', cervicalTop.x + 12, cervicalTop.y + 4);
+  ctx.fillText('L5 Lumbar', sacrumBase.x + 12, sacrumBase.y + 4);
+}
+
+function handleCalibration() {
+  state.baseline.eyeShoulderDist = null;
+  addLog('Baseline reset. Sit up straight for recalibration...', 'warning');
+}
+
+function triggerAudioAlert() {
+  if (state.isMuted) return;
+
+  try {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    if (audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(440, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.3);
+
+    gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.3);
+  } catch (e) {
+    console.warn('Audio Error:', e);
   }
 }
 
 function toggleAudio() {
-  state.isAudioEnabled = !state.isAudioEnabled;
-  const btn = document.getElementById('audio-toggle-btn');
-  if (btn) {
-    if (state.isAudioEnabled) {
-      btn.classList.remove('opacity-50');
-      btn.innerHTML = `<i data-lucide="volume-2" class="w-3 h-3"></i> Haptic Audio Alert`;
-    } else {
-      btn.classList.add('opacity-50');
-      btn.innerHTML = `<i data-lucide="volume-x" class="w-3 h-3"></i> Muted`;
-    }
-  }
-  if (window.lucide) lucide.createIcons();
-}
-
-function triggerHapticPulse(freq = 440, duration = 150) {
-  if (!state.isAudioEnabled) return;
-  try {
-    initAudio();
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume();
-    }
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    
-    osc.type = 'sawtooth';
-    osc.frequency.value = freq;
-    
-    gain.gain.setValueAtTime(0.15, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + (duration / 1000));
-    
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    
-    osc.start();
-    osc.stop(audioCtx.currentTime + (duration / 1000));
-  } catch(e) {
-    console.log("Audio feedback error:", e);
-  }
-}
-
-function triggerHapticTest() {
-  triggerHapticPulse(520, 200);
-}
-
-// MODE SWITCHING (HARDWARE vs WEBCAM VISION)
-function setMode(mode) {
-  state.mode = mode;
-  const hwBtn = document.getElementById('mode-hardware-btn');
-  const visBtn = document.getElementById('mode-vision-btn');
-  const visionContainer = document.getElementById('vision-container');
-
-  if (mode === 'hardware') {
-    if (hwBtn) hwBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 text-white transition-all shadow-sm";
-    if (visBtn) visBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-slate-400 hover:text-white transition-all";
-    if (visionContainer) visionContainer.classList.add('hidden');
-    
-    const connText = document.getElementById('connection-text');
-    if (connText) connText.innerText = "ESP32 BLE: Connected";
+  state.isMuted = !state.isMuted;
+  if (state.isMuted) {
+    if (elements.audioIcon) elements.audioIcon.className = 'fa-solid fa-volume-xmark';
+    addLog('Audio alerts muted.', 'info');
   } else {
-    if (visBtn) visBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 text-white transition-all shadow-sm";
-    if (hwBtn) hwBtn.className = "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-slate-400 hover:text-white transition-all";
-    if (visionContainer) visionContainer.classList.remove('hidden');
-    
-    const connText = document.getElementById('connection-text');
-    if (connText) connText.innerText = "Camera Vision: Active";
-    startWebcam();
+    if (elements.audioIcon) elements.audioIcon.className = 'fa-solid fa-volume-high';
+    addLog('Audio alerts unmuted.', 'info');
   }
 }
 
-function startWebcam() {
-  const video = document.getElementById('webcam');
-  if (video && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-    navigator.mediaDevices.getUserMedia({ video: true })
-      .then(stream => {
-        video.srcObject = stream;
-      })
-      .catch(err => {
-        console.warn("Webcam access declined or unavailable:", err);
-      });
-  }
-}
+function toggleDemoMode() {
+  state.isDemoMode = elements.demoModeToggle ? elements.demoModeToggle.checked : false;
 
-// AUTO-SIMULATE SLOUCH CYCLE
-function toggleSlouchSimulation() {
-  const btn = document.getElementById('sim-slouch-btn');
-  if (state.isSimulating) {
-    clearInterval(state.simInterval);
-    state.isSimulating = false;
-    if (btn) {
-      btn.classList.remove('bg-rose-500', 'text-white');
-      btn.classList.add('bg-rose-500/10', 'text-rose-400');
-      btn.innerHTML = `<i data-lucide="play-circle" class="w-4 h-4"></i> Auto-Simulate Slouch`;
-    }
-    updatePitch(5);
+  if (state.isDemoMode) {
+    if (state.isRunning) stopCamera();
+    state.isRunning = true;
+    startSessionTimer();
+    if (elements.calibrateBtn) elements.calibrateBtn.disabled = false;
+    addLog('Simulated Demo Mode active.', 'info');
+    runDemoLoop();
   } else {
-    state.isSimulating = true;
-    if (btn) {
-      btn.classList.remove('bg-rose-500/10', 'text-rose-400');
-      btn.classList.add('bg-rose-500', 'text-white');
-      btn.innerHTML = `<i data-lucide="stop-circle" class="w-4 h-4"></i> Stop Simulation`;
+    state.isRunning = false;
+    if (demoAnimationFrame) {
+      cancelAnimationFrame(demoAnimationFrame);
     }
-    
-    let step = 0;
-    state.simInterval = setInterval(() => {
-      step++;
-      const targetPitch = 5 + Math.sin(step * 0.2) * 25;
-      updatePitch(Math.max(-5, targetPitch));
-      const slider = document.getElementById('pitchSlider');
-      if (slider) slider.value = state.pitch;
-    }, 200);
+    stopSessionTimer();
+    elements.ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
+    updateStatus('neutral', 'System Ready');
+    addLog('Exited Demo Mode.', 'info');
   }
-  if (window.lucide) lucide.createIcons();
 }
 
-// TELEMETRY HISTORY & SCORE TIMER
-function startTelemetryTimer() {
-  setInterval(() => {
-    state.history.shift();
-    state.history.push(state.pitch);
-    renderChart();
+function runDemoLoop() {
+  if (!state.isDemoMode) return;
 
-    const isSlouching = (state.pitch - state.baseline) > state.threshold;
+  resizeCanvas();
 
-    if (isSlouching) {
-      state.slouchSeconds++;
-      state.score = Math.max(20, state.score - 1);
-      triggerHapticPulse(300, 100);
-    } else {
-      state.score = Math.min(100, state.score + 0.5);
-    }
+  const ctx = elements.ctx;
+  const time = Date.now() * 0.0025;
 
-    const scoreText = document.getElementById('score-text');
-    const scoreBar = document.getElementById('score-bar');
-    if (scoreText) scoreText.innerText = `${Math.round(state.score)}%`;
-    if (scoreBar) scoreBar.style.width = `${Math.round(state.score)}%`;
-    
-    const mins = Math.floor(state.slouchSeconds / 60).toString().padStart(2, '0');
-    const secs = (state.slouchSeconds % 60).toString().padStart(2, '0');
-    const timerElem = document.getElementById('slouch-timer');
-    if (timerElem) timerElem.innerText = `${mins}:${secs}`;
+  ctx.clearRect(0, 0, elements.canvas.width, elements.canvas.height);
 
-    const badge = document.getElementById('status-badge');
-    const statusText = document.getElementById('slouch-status-text');
+  ctx.fillStyle = '#1e293b';
+  ctx.fillRect(0, 0, elements.canvas.width, elements.canvas.height);
 
-    if (isSlouching) {
-      if (badge) {
-        badge.className = "absolute top-4 right-4 px-3.5 py-1.5 rounded-full text-xs font-bold bg-rose-500/20 text-rose-400 border border-rose-500/30 flex items-center gap-2 shadow-lg status-alert";
-        badge.innerHTML = `<span class="w-2 h-2 rounded-full bg-rose-500 animate-ping"></span> SLOUCH DETECTED`;
-      }
-      if (statusText) {
-        statusText.innerText = "Spine threshold exceeded!";
-        statusText.className = "text-[10px] text-rose-400 font-bold mt-3 font-mono";
-      }
-    } else {
-      if (badge) {
-        badge.className = "absolute top-4 right-4 px-3.5 py-1.5 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 flex items-center gap-2 shadow-lg";
-        badge.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span> OPTIMAL POSTURE`;
-      }
-      if (statusText) {
-        statusText.innerText = "Good spinal alignment";
-        statusText.className = "text-[10px] text-slate-500 mt-3 font-mono";
-      }
+  const slouchCycle = Math.sin(time);
+  const slouchOffset = slouchCycle > 0.1 ? slouchCycle * 0.12 : 0;
+
+  const mockLandmarks = {
+    0: { x: 0.5, y: 0.22 + (slouchOffset * 0.5) },
+    2: { x: 0.45, y: 0.25 + (slouchOffset * 0.5) },
+    5: { x: 0.55, y: 0.25 + (slouchOffset * 0.5) },
+    11: { x: 0.38, y: 0.45, visibility: 0.9 },
+    12: { x: 0.62, y: 0.45, visibility: 0.9 },
+  };
+
+  processLandmarks(mockLandmarks);
+
+  demoAnimationFrame = requestAnimationFrame(runDemoLoop);
+}
+
+function updateStatus(type, text) {
+  if (elements.statusBadge) elements.statusBadge.className = `badge badge-${type}`;
+  if (elements.statusText) elements.statusText.textContent = text;
+}
+
+function startSessionTimer() {
+  if (timerInterval) clearInterval(timerInterval);
+  state.metrics.sessionStartTime = Date.now();
+  state.continuousSittingTime = 0;
+
+  timerInterval = setInterval(() => {
+    const elapsedSec = Math.floor((Date.now() - state.metrics.sessionStartTime) / 1000);
+    const mins = String(Math.floor(elapsedSec / 60)).padStart(2, '0');
+    const secs = String(elapsedSec % 60).padStart(2, '0');
+    if (elements.durationText) elements.durationText.textContent = `${mins}:${secs}`;
+
+    // Feature: Micro-break check (triggers every 20 mins / 1200s)
+    state.continuousSittingTime++;
+    if (state.continuousSittingTime >= 1200) {
+      addLog('🧘 Stretch Break Time! Stand up and stretch your shoulders.', 'warning');
+      alert('🧘 Stretch Break Reminder!\nYou have been sitting for 20 minutes. Take 30 seconds to expand your chest!');
+      state.continuousSittingTime = 0;
     }
   }, 1000);
 }
 
-// RENDER HISTORICAL TELEMETRY BAR CHART
-function renderChart() {
-  const container = document.getElementById('chart-bars-container');
-  if (!container) return;
-  container.innerHTML = '';
-
-  state.history.forEach((val) => {
-    const bar = document.createElement('div');
-    const heightPercent = Math.min(100, Math.max(10, (val / 40) * 100));
-    const isOver = val > state.threshold;
-
-    bar.className = `flex-1 rounded-t transition-all duration-300 ${isOver ? 'bg-rose-500 shadow-lg shadow-rose-500/20' : 'bg-indigo-500/60 hover:bg-indigo-400'}`;
-    bar.style.height = `${heightPercent}%`;
-    container.appendChild(bar);
-  });
+function stopSessionTimer() {
+  if (timerInterval) clearInterval(timerInterval);
+  if (elements.durationText) elements.durationText.textContent = '00:00';
 }
 
-// 2D CANVAS SPINE KINEMATICS ANIMATION LOOP
-function renderLoop() {
-  if (ctx && canvas) {
-    drawSpine();
-  }
-  requestAnimationFrame(renderLoop);
+function addLog(message, type = 'info') {
+  if (!elements.eventLog) return;
+  const iconMap = {
+    info: 'fa-circle-info',
+    warning: 'fa-triangle-exclamation',
+    danger: 'fa-circle-xmark',
+    success: 'fa-circle-check',
+  };
+
+  const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const li = document.createElement('li');
+  li.className = `log-item ${type}`;
+  li.innerHTML = `<i class="fa-solid ${iconMap[type]}"></i> [${timeStr}] ${message}`;
+
+  elements.eventLog.prepend(li);
 }
 
-function drawSpine() {
-  if (!canvas || !ctx) return;
+function toggleTheme() {
+  const currentTheme = document.body.getAttribute('data-theme');
 
-  const w = canvas.width;
-  const h = canvas.height;
-
-  if (w === 0 || h === 0) return;
-
-  ctx.clearRect(0, 0, w, h);
-
-  const centerX = w / 2;
-  const startY = h * 0.82;
-  const spineLength = h * 0.52;
-
-  const currentPitch = state.pitch - state.baseline;
-  const isSlouching = currentPitch > state.threshold;
-
-  // Draw Grid
-  ctx.strokeStyle = 'rgba(51, 65, 85, 0.25)';
-  ctx.lineWidth = 1;
-  for (let y = 0; y < h; y += 35) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    ctx.stroke();
+  if (currentTheme === 'light') {
+    document.body.removeAttribute('data-theme');
+    if (elements.themeToggleBtn) elements.themeToggleBtn.innerHTML = `<i class="fa-solid fa-moon"></i>`;
+  } else {
+    document.body.setAttribute('data-theme', 'light');
+    if (elements.themeToggleBtn) elements.themeToggleBtn.innerHTML = `<i class="fa-solid fa-sun"></i>`;
   }
-
-  // Calculate Curve Points
-  const numVertebrae = 10;
-  const points = [];
-  const bendAmount = (currentPitch / 45) * 110;
-
-  for (let i = 0; i <= numVertebrae; i++) {
-    const t = i / numVertebrae;
-    const y = startY - (t * spineLength);
-    const x = centerX + Math.pow(t, 1.8) * bendAmount;
-    points.push({ x, y });
-  }
-
-  // Baseline Reference Axis
-  ctx.beginPath();
-  ctx.setLineDash([4, 4]);
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.25)';
-  ctx.lineWidth = 2;
-  ctx.moveTo(centerX, startY);
-  ctx.lineTo(centerX, startY - spineLength);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // Draw Spine Line
-  ctx.beginPath();
-  ctx.moveTo(points[0].x, points[0].y);
-  for (let i = 1; i < points.length; i++) {
-    const xc = (points[i].x + points[i-1].x) / 2;
-    const yc = (points[i].y + points[i-1].y) / 2;
-    ctx.quadraticCurveTo(points[i-1].x, points[i-1].y, xc, yc);
-  }
-  ctx.strokeStyle = isSlouching ? '#f43f5e' : '#6366f1';
-  ctx.lineWidth = 6;
-  ctx.lineCap = 'round';
-  ctx.stroke();
-
-  // Draw Vertebrae Nodes
-  points.forEach((pt, idx) => {
-    ctx.beginPath();
-    ctx.arc(pt.x, pt.y, idx === points.length - 1 ? 9 : 5, 0, Math.PI * 2);
-    ctx.fillStyle = idx === points.length - 1 
-      ? (isSlouching ? '#f43f5e' : '#818cf8')
-      : '#020617';
-    ctx.fill();
-    ctx.strokeStyle = isSlouching ? '#fb7185' : '#818cf8';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-  });
-
-  // Draw Head Ring
-  const headPt = points[points.length - 1];
-  ctx.beginPath();
-  ctx.arc(headPt.x + (bendAmount * 0.12), headPt.y - 24, 18, 0, Math.PI * 2);
-  ctx.fillStyle = isSlouching ? 'rgba(244, 63, 94, 0.15)' : 'rgba(99, 102, 241, 0.15)';
-  ctx.fill();
-  ctx.strokeStyle = isSlouching ? '#f43f5e' : '#818cf8';
-  ctx.lineWidth = 2;
-  ctx.stroke();
 }
+
+// Feature: Global Helper to apply sensitivity presets ('strict', 'normal', 'relaxed')
+window.applyPreset = function(presetKey) {
+  const preset = PRESETS[presetKey];
+  if (!preset) return;
+
+  state.thresholds.slouchSensPercent = preset.slouchPercent;
+  state.thresholds.tiltAngleDeg = preset.tiltAngle;
+  state.thresholds.alertDelaySec = preset.delaySec;
+
+  if (elements.slouchSensInput) elements.slouchSensInput.value = preset.slouchPercent;
+  if (elements.slouchSensVal) elements.slouchSensVal.textContent = `${preset.slouchPercent}%`;
+  if (elements.tiltSensInput) elements.tiltSensInput.value = preset.tiltAngle;
+  if (elements.tiltSensVal) elements.tiltSensVal.textContent = `${preset.tiltAngle}°`;
+  if (elements.alertDelayInput) elements.alertDelayInput.value = preset.delaySec;
+  if (elements.alertDelayVal) elements.alertDelayVal.textContent = `${preset.delaySec.toFixed(1)}s`;
+
+  addLog(`Applied '${presetKey.toUpperCase()}' sensitivity preset.`, 'info');
+};
+
+// Feature: Export Session CSV Report
+window.exportSessionCSV = function() {
+  const duration = elements.durationText ? elements.durationText.textContent : '00:00';
+  const score = elements.scoreText ? elements.scoreText.textContent : '100%';
+  const slouchCount = state.metrics.slouchCount;
+
+  const csvContent = "data:text/csv;charset=utf-8," 
+    + "Session Duration,Posture Score,Total Slouches\n"
+    + `"${duration}","${score}",${slouchCount}\n`;
+
+  const encodedUri = encodeURI(csvContent);
+  const link = document.createElement("a");
+  link.setAttribute("href", encodedUri);
+  link.setAttribute("download", `posture_report_${Date.now()}.csv`);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+
+  addLog('Session posture report exported as CSV.', 'success');
+};
